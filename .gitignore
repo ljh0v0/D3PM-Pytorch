@@ -1,0 +1,9 @@
+*__pycache__*
+datasets
+exp/*
+samples
+venv
+.idea/*
+clean_model_dir.sh
+*.swp
+*.swo
