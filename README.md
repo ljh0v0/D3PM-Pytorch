@@ -2,7 +2,7 @@
 
 Unofficial PyTorch implementation of Discrete Denoising Diffusion Probabilistic Models(D3PMs)
 
-🚧 CONSTRUCTING...
+🚧 UNDER CONSTRUCTION...
 
 ## Training
 ```
