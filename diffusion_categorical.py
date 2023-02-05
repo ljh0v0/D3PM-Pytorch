@@ -144,7 +144,6 @@ class CategoricalDiffusion(nn.Module):
         # Only need transpose of q_onestep_mats for posterior computation.
         # self.transpose_q_onestep_mats = torch.transpose(self.q_onestep_mats,1,2)
         self.register("transpose_q_onestep_mats", torch.transpose(self.q_onestep_mats, 1, 2))
-        print("done")
         # del self.q_onestep_mats
 
     def register(self, name, tensor):
@@ -386,11 +385,10 @@ class CategoricalDiffusion(nn.Module):
         inv_scale = torch.exp(- (log_scale - 2.))
 
         bin_width = 2. / (self.num_pixel_vals - 1.)
-        bin_centers = torch.linspace(start=-1., stop=1., num=self.num_pixel_vals,
-                                     endpoint=True)
+        bin_centers = torch.linspace(start=-1., end=1., steps=self.num_pixel_vals)
 
         bin_centers = torch.tensor(np.expand_dims(bin_centers.numpy(),
-                                                  axis=tuple(range(0, loc.ndim - 1))))
+                                                  axis=tuple(range(0, loc.ndim - 1)))).to(loc.device)
 
         bin_centers = bin_centers - loc
         log_cdf_min = F.logsigmoid(
@@ -494,7 +492,7 @@ class CategoricalDiffusion(nn.Module):
         return model_logits, pred_x_start_logits
 
     # === Sampling ===
-
+    @torch.no_grad()
     def p_sample(self, model_fn, *, x, t, noise):
         """Sample one timestep from the model p(x_{t-1} | x_t)."""
         model_logits, pred_x_start_logits = self.p_logits(
@@ -516,6 +514,7 @@ class CategoricalDiffusion(nn.Module):
         assert pred_x_start_logits.shape == model_logits.shape
         return sample, F.softmax(pred_x_start_logits, dim=-1)
 
+    @torch.no_grad()
     def p_sample_loop(self, model_fn, shape,
                       num_timesteps=None, return_x_init=False):
         """Ancestral sampling."""
@@ -523,6 +522,7 @@ class CategoricalDiffusion(nn.Module):
         # del rng
 
         device = 'cuda' if next(model_fn.parameters()).is_cuda else 'cpu'
+        logger.info(device)
         noise_shape = shape + (self.num_pixel_vals,)
 
         if self.transition_mat_type in ['gaussian', 'uniform']:
@@ -599,7 +599,8 @@ class CategoricalDiffusion(nn.Module):
         """KL(q(x_{T-1}|x_start)|| U(x_{T-1}|0, num_pixel_vals-1))."""
         q_probs = self.q_probs(
             x_start=x_start,
-            t=torch.full((x_start.shape[0],), self.num_timesteps - 1))
+            t=torch.full((x_start.shape[0],), self.num_timesteps - 1).to(x_start.device)
+        )
 
         if self.transition_mat_type in ['gaussian', 'uniform']:
             # Stationary distribution is a uniform distribution over all pixel values.
@@ -653,10 +654,6 @@ class CategoricalDiffusion(nn.Module):
         # noise_rng, time_rng = jax.random.split(rng)
         noise = torch.rand(size=x_start.shape + (self.num_pixel_vals,)).to(x_start.device)
 
-        # noise = torch.full(size=noise.shape, fill_value=0, dtype=noise.dtype).to(x_start.device)
-        # x_start = torch.full(x_start.shape, 127).to(x_start.device)
-        # t = torch.tensor([0, 100, 200, 300, 400, 500, 600, 700, 800, 900]).to(x_start.device)
-
         # t starts at zero. so x_0 is the first noisy datapoint, not the datapoint
         # itself.
         x_t = self.q_sample(x_start=x_start, t=t, noise=noise)
@@ -684,11 +681,11 @@ class CategoricalDiffusion(nn.Module):
         else:
             raise NotImplementedError(self.loss_type)
 
-        print(losses)
         assert losses.shape == t.shape
         return losses
 
-    def calc_bpd_loop(self, model_fn, *, x_start):
+    @torch.no_grad()
+    def calc_bpd_loop(self, model_fn, x_start):
         """Calculate variational bound (loop over all timesteps and sum)."""
         batch_size = x_start.shape[0]
 
@@ -696,7 +693,7 @@ class CategoricalDiffusion(nn.Module):
 
         vbterms = []
         for t in reversed(range(self.num_timesteps)):
-            t_b = torch.full((batch_size,), t)
+            t_b = torch.full((batch_size,), t).to(x_start.device)
 
             vb, _ = self.vb_terms_bpd(
                 model_fn=model_fn, x_start=x_start, t=t_b,

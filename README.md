@@ -1,18 +1,23 @@
-# D3PM Image experiments
+#  Discrete Denoising Diffusion Probabilistic Models(D3PMs) for image
 
-This subdirectory contains the implementation of the D3PM image generation models.
+Unofficial PyTorch implementation of Discrete Denoising Diffusion Probabilistic Models(D3PMs)
 
-File that implements the D3PM diffusion processes: `diffusion-categorical.py`
+## Training
+```
+python3 main.py --train 1 --comet 1 --exp_dir "path/to/exp_dir/" --n_gpu 1 --ckpt_freq 20
+```
 
-Files that define the training loop and experiment framework:
-- `main.py` is the main executable, which instantiates all required components.
-- `entry_point.py` handles setting up the training job and reading arguments.
-- `gm.py` implements a generic trainable model and training loop.
+## Sampling
+```
+python sample.py --config "path/to/config.json" --model_dir "path/to/model.ckpt" --sample_dir "path/to/save/sample" --batch_size 128 --n_samples 10000
+```
 
-Files that set up the model and data:
-- `config.py` constructs the configuration object used for the experiments.
-- `model.py` implements the `unet0` model in Flax.
-- `datasets.py` gives access to the CIFAR 10 dataset.
+## Reference
 
-Utilities:
-- `utils.py` defines various other helper functions.
+**Paper**
+
+[Structured Denoising Diffusion Models in Discrete State-Spaces](https://arxiv.org/abs/2107.03006)
+
+**Code**
+
+[google-research/d3pm](https://github.com/google-research/google-research/tree/master/d3pm)

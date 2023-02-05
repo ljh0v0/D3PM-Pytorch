@@ -5,6 +5,7 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
+import numpy as np
 
 import utils
 
@@ -86,30 +87,37 @@ class Upsample(nn.Sequential):
         super().__init__(*layers)
 
 
-class Downsample(nn.Sequential):
+class Downsample(nn.Module):
     def __init__(self, channel):
-        layers = [conv2d(channel, channel, 3, stride=2, padding=1)]
+        super().__init__()
+        self.downsample = nn.Sequential(conv2d(channel, channel, 3, stride=2))
 
-        super().__init__(*layers)
+
+    def forward(self, input):
+        input_pad = F.pad(input, [0, 1, 0, 1])
+
+        return self.downsample(input_pad)
 
 
 class ResBlock(nn.Module):
     def __init__(self, in_channel, out_channel, time_dim, dropout):
         super().__init__()
 
-        self.norm1 = nn.GroupNorm(32, in_channel)
+        self.norm1 = nn.GroupNorm(32, in_channel, eps=1e-06)
         self.activation1 = Swish()
         self.conv1 = conv2d(in_channel, out_channel, 3, padding=1)
 
         self.time = nn.Sequential(Swish(), linear(time_dim, out_channel))
 
-        self.norm2 = nn.GroupNorm(32, out_channel)
+        self.norm2 = nn.GroupNorm(32, out_channel, eps=1e-06)
         self.activation2 = Swish()
         self.dropout = nn.Dropout(dropout)
         self.conv2 = conv2d(out_channel, out_channel, 3, padding=1, scale=1e-10)
 
         if in_channel != out_channel:
-            self.skip = conv2d(in_channel, out_channel, 1)
+            # TODO
+            # self.skip = conv2d(in_channel, out_channel, 1)
+            self.skip = linear(in_channel, out_channel)
 
         else:
             self.skip = None
@@ -124,37 +132,88 @@ class ResBlock(nn.Module):
         out = self.conv2(self.dropout(self.activation2(self.norm2(out))))
 
         if self.skip is not None:
-            input = self.skip(input)
+            # TODO
+            # input = self.skip(input)
+            input = self.skip(input.permute(0, 2, 3, 1).contiguous())
+            input = input.permute(0, 3, 1, 2)
 
         return out + input
 
+def zero_module(module):
+    """
+    Zero out the parameters of a module and return it.
+    """
+    for p in module.parameters():
+        p.detach().zero_()
+    return module
 
 class SelfAttention(nn.Module):
-    def __init__(self, in_channel):
+    """
+    An attention block that allows spatial positions to attend to each other.
+    Originally ported from here, but adapted to the N-d case.
+    https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0706c543/diffusion_tf/models/unet.py#L66.
+    """
+
+    def __init__(self, channels, n_head=1):
         super().__init__()
+        self.channels = channels
+        self.num_heads = n_head
 
-        self.norm = nn.GroupNorm(32, in_channel)
-        self.qkv = conv2d(in_channel, in_channel * 4, 1)
-        self.out = conv2d(in_channel, in_channel, 1, scale=1e-10)
+        self.norm = nn.GroupNorm(32, channels)
+        self.qkv = nn.Conv1d(channels, channels * 3, 1)
+        self.attention = QKVAttention()
+        self.proj_out = zero_module(nn.Conv1d(channels, channels, 1))
 
-    def forward(self, input):
-        batch, channel, height, width = input.shape
+    def forward(self, x):
+        b, c, *spatial = x.shape
+        x = x.reshape(b, c, -1)
+        qkv = self.qkv(self.norm(x))
+        qkv = qkv.reshape(b * self.num_heads, -1, qkv.shape[2])
+        h = self.attention(qkv)
+        h = h.reshape(b, -1, h.shape[-1])
+        h = self.proj_out(h)
+        return (x + h).reshape(b, c, *spatial)
 
-        norm = self.norm(input)
-        qkv = self.qkv(norm)
-        query, key, value = qkv.chunk(3, dim=1)
 
-        attn = torch.einsum("nchw, ncyx -> nhwyx", query, key).contiguous() / math.sqrt(
-            channel
-        )
-        attn = attn.view(batch, height, width, -1)
-        attn = torch.softmax(attn, -1)
-        attn = attn.view(batch, height, width, height, width)
+class QKVAttention(nn.Module):
+    """
+    A module which performs QKV attention.
+    """
 
-        out = torch.einsum("nhwyx, ncyx -> nchw", attn, input).contiguous()
-        out = self.out(out)
+    def forward(self, qkv):
+        """
+        Apply QKV attention.
+        :param qkv: an [N x (C * 3) x T] tensor of Qs, Ks, and Vs.
+        :return: an [N x C x T] tensor after attention.
+        """
+        ch = qkv.shape[1] // 3
+        q, k, v = torch.split(qkv, ch, dim=1)
+        scale = 1 / math.sqrt(math.sqrt(ch))
+        weight = torch.einsum(
+            "bct,bcs->bts", q * scale, k * scale
+        )  # More stable with f16 than dividing afterwards
+        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
+        return torch.einsum("bts,bcs->bct", weight, v)
 
-        return out + input
+    @staticmethod
+    def count_flops(model, _x, y):
+        """
+        A counter for the `thop` package to count the operations in an
+        attention operation.
+        Meant to be used like:
+            macs, params = thop.profile(
+                model,
+                inputs=(inputs, timestamps),
+                custom_ops={QKVAttention: QKVAttention.count_flops},
+            )
+        """
+        b, c, *spatial = y[0].shape
+        num_spatial = int(np.prod(spatial))
+        # We perform two matmuls with the same number of ops.
+        # The first computes the weight matrix, the second computes
+        # the combination of the value vectors.
+        matmul_ops = 2 * b * (num_spatial ** 2) * c
+        model.total_ops += torch.DoubleTensor([matmul_ops])
 
 
 class TimeEmbedding(nn.Module):
@@ -176,13 +235,13 @@ class TimeEmbedding(nn.Module):
 
 
 class ResBlockWithAttention(nn.Module):
-    def __init__(self, in_channel, out_channel, time_dim, dropout, use_attention=False):
+    def __init__(self, in_channel, out_channel, time_dim, dropout, attention_head=1, use_attention=False):
         super().__init__()
 
         self.resblocks = ResBlock(in_channel, out_channel, time_dim, dropout)
 
         if use_attention:
-            self.attention = SelfAttention(out_channel)
+            self.attention = SelfAttention(out_channel, n_head=attention_head)
 
         else:
             self.attention = None
@@ -235,6 +294,7 @@ class UNet(nn.Module):
             channel_multiplier,
             n_res_blocks,
             attn_resolutions,
+            num_heads=1,
             dropout=0,
             model_output=str,  # 'logits' or 'logistic_pars'
             num_pixel_vals=256,
@@ -273,6 +333,7 @@ class UNet(nn.Module):
                         channel_mult,
                         time_dim,
                         dropout,
+                        attention_head=num_heads,
                         use_attention=2 ** i in attn_strides,
                     )
                 )
@@ -293,6 +354,7 @@ class UNet(nn.Module):
                     in_channel,
                     time_dim,
                     dropout=dropout,
+                    attention_head=num_heads,
                     use_attention=True,
                 ),
                 ResBlockWithAttention(
@@ -312,6 +374,7 @@ class UNet(nn.Module):
                         channel_mult,
                         time_dim,
                         dropout=dropout,
+                        attention_head=num_heads,
                         use_attention=2 ** i in attn_strides,
                     )
                 )
@@ -327,13 +390,13 @@ class UNet(nn.Module):
             # The output represents logits or the log scale and loc of a
             # logistic distribution.
             self.out = nn.Sequential(
-                nn.GroupNorm(32, in_channel),
+                nn.GroupNorm(32, in_channel, eps=1e-06),
                 Swish(),
                 conv2d(in_channel, out_channel * 2, 3, padding=1, scale=1e-10),
             )
         else:
             self.out = nn.Sequential(
-                nn.GroupNorm(32, in_channel),
+                nn.GroupNorm(32, in_channel, eps=1e-06),
                 Swish(),
                 conv2d(in_channel, out_channel * self.num_pixel_vals, 3, padding=1, scale=1e-10),
             )
@@ -342,7 +405,7 @@ class UNet(nn.Module):
         time_embed = self.time(time)
 
         feats = []
-
+        #
         # out = spatial_fold(input, self.fold)
         batch_size, channels, height, width = input.shape
         input_onehot = F.one_hot(input.to(torch.int64), num_classes=self.num_pixel_vals)
@@ -374,7 +437,7 @@ class UNet(nn.Module):
             out = torch.tanh(loc + input), log_scale
         else:
             out = torch.reshape(out, (batch_size, self.out_channel, self.num_pixel_vals, height, width))
-            out = out.permute(0, 1, 3, 4, 2)
+            out = out.permute(0, 1, 3, 4, 2).contiguous()
             out = out + input_onehot
 
         return out

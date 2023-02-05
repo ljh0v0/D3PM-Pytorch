@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CIFAR10 diffusion model."""
+"""CIFAR10 D3PM."""
 
 from typing import Dict
 import torch
@@ -29,10 +29,11 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import CometLogger, TensorBoardLogger
 from PIL import Image
+import ml_collections
+import json
+import argparse
 
 import model
-import model_1
-import utils
 import datasets
 from diffusion_categorical import make_diffusion
 from config import get_config
@@ -45,6 +46,7 @@ def samples_fn(model, diffusion, shape, num_timesteps=None):
         'samples': samples
     }
 
+
 def accumulate(model1, model2, decay=0.9999):
     par1 = dict(model1.named_parameters())
     par2 = dict(model2.named_parameters())
@@ -56,10 +58,11 @@ def accumulate(model1, model2, decay=0.9999):
 class DiffusionModel(pl.LightningModule):
     """diffusion model."""
 
-    def __init__(self, config):
+    def __init__(self, config, exp_dir):
         super().__init__()
 
         self.config = config
+        self.exp_dir = exp_dir
 
         assert self.config.dataset.name in {'cifar10', 'MockCIFAR10'}
         self.num_bits = 8
@@ -67,7 +70,6 @@ class DiffusionModel(pl.LightningModule):
         # Ensure that max_time in model and num_timesteps in the betas are the same.
         self.num_timesteps = self.config.model.diffusion_betas.num_timesteps
         self.ema_decay = self.config.train.ema_decay
-        self.log_img_every_epoch = self.config.train.log_img_every_epoch
 
         assert self.config.train.num_train_steps is not None
         assert self.config.train.num_train_steps % self.config.train.substeps == 0
@@ -81,10 +83,11 @@ class DiffusionModel(pl.LightningModule):
             channel_multiplier=self.config.model.args.channel_multiplier,
             n_res_blocks=self.config.model.args.n_res_blocks,
             attn_resolutions=self.config.model.args.attn_resolutions,
+            num_heads=self.config.model.args.num_heads,
             dropout=self.config.model.args.dropout,
             model_output=self.config.model.args.model_output,
             num_pixel_vals=self.config.model.args.num_pixel_vals,
-            img_size = self.config.dataset.resolution
+            img_size=self.config.dataset.resolution
         )
 
         self.ema = model.UNet(
@@ -94,31 +97,12 @@ class DiffusionModel(pl.LightningModule):
             channel_multiplier=self.config.model.args.channel_multiplier,
             n_res_blocks=self.config.model.args.n_res_blocks,
             attn_resolutions=self.config.model.args.attn_resolutions,
+            num_heads=self.config.model.args.num_heads,
             dropout=self.config.model.args.dropout,
             model_output=self.config.model.args.model_output,
             num_pixel_vals=self.config.model.args.num_pixel_vals,
             img_size=self.config.dataset.resolution
         )
-
-        # self.model = model_1.Unet(
-        #     dim=self.config.model.args.channel,
-        #     channels=self.config.model.args.in_channel,
-        #     out_dim=self.config.model.args.out_channel,
-        #     dim_mults=self.config.model.args.channel_multiplier,
-        #     model_output=self.config.model.args.model_output,
-        #     num_pixel_vals=self.config.model.args.num_pixel_vals
-        # )
-        #
-        # self.ema = model_1.Unet(
-        #     dim=self.config.model.args.channel,
-        #     channels=self.config.model.args.in_channel,
-        #     out_dim=self.config.model.args.out_channel,
-        #     dim_mults=self.config.model.args.channel_multiplier,
-        #     model_output=self.config.model.args.model_output,
-        #     num_pixel_vals=self.config.model.args.num_pixel_vals
-        # )
-
-        print(self.model)
 
         # Build Diffusion model
         self.diffusion = make_diffusion(self.config.model)
@@ -141,15 +125,20 @@ class DiffusionModel(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         img, _ = batch
-        save_image(img, './samples/x.png', normalize=True, scale_each=True, nrow=2)
         # t = np.random.randint(size=(img.shape[0],), low=0, high=self.num_timesteps, dtype=np.int32)
         t = (torch.randint(low=0, high=(self.num_timesteps), size=(img.shape[0],))).to(img.device)
         loss = self.diffusion.training_losses(self.model, img, t).mean()
 
-        accumulate(self.ema, self.model.module if isinstance(self.model, nn.DataParallel) else self.model, self.ema_decay)
+        accumulate(self.ema, self.model.module if isinstance(self.model, nn.DataParallel) else self.model,
+                   self.ema_decay)
 
-        if batch_idx % self.config.train.log_loss_every_steps == 0:
-            self.logger.log_metrics({"epoch": self.current_epoch, "steps": batch_idx, "train/loss": loss})
+        if self.global_step % self.config.train.log_loss_every_steps == 0:
+            self.logger.log_metrics({"train_loss": loss}, step=self.global_step)
+
+        if self.global_step % self.config.train.retain_checkpoint_every_steps == 0:
+            filename = f"checkpoint_{self.global_step}.ckpt"
+            ckpt_path = os.path.join(self.exp_dir, "retain-checkpoint", filename)
+            self.trainer.save_checkpoint(ckpt_path)
 
         return {'loss': loss}
 
@@ -168,20 +157,32 @@ class DiffusionModel(pl.LightningModule):
         t = (torch.randint(low=0, high=(self.num_timesteps), size=(img.shape[0],))).to(img.device)
         loss = self.diffusion.training_losses(self.ema, img, t).mean()
 
-        return {'val_loss': loss}
+        bpd_dict = self.diffusion.calc_bpd_loop(self.ema, img)
+        total_bpd = bpd_dict['total'].mean()
+        prior_bpd = bpd_dict['prior'].mean()
+
+        return {'val_loss': loss, "total_bpd": total_bpd, "prior_bpd": prior_bpd}
+        #return {'val_loss': loss}
 
     def validation_epoch_end(self, outputs):
         avg_loss = torch.stack([x['val_loss'] for x in outputs]).mean()
-        self.logger.log_metrics({"epoch": self.current_epoch, "val/loss": avg_loss})
+        self.logger.log_metrics({"val_loss": avg_loss}, step=self.global_step)
 
-        if self.current_epoch % self.log_img_every_epoch == 0:
-            shape = (16, 3, self.config.dataset.resolution, self.config.dataset.resolution)
-            sample = samples_fn(self.ema, self.diffusion, shape, num_timesteps=10)
+        avg_total_bpd = torch.stack([x['total_bpd'] for x in outputs]).mean()
+        self.logger.log_metrics({"total bpd": avg_total_bpd}, step=self.global_step)
 
-            grid = make_grid(sample['samples'], nrow=4)
-            ndarr = grid.permute(1, 2, 0).to('cpu', torch.uint8).numpy()
-            im = Image.fromarray(ndarr)
-            self.logger.experiment.log_image(im, name='val-img-epoch' + str(self.current_epoch), step=self.current_epoch)
+        avg_prior_bpd = torch.stack([x['prior_bpd'] for x in outputs]).mean()
+        self.logger.log_metrics({"prior bpd": avg_prior_bpd}, step=self.global_step)
+
+        # sample
+        shape = (64, 3, self.config.dataset.resolution, self.config.dataset.resolution)
+        sample = samples_fn(self.ema, self.diffusion, shape)
+
+        grid = make_grid(sample['samples'], nrow=8)
+        ndarr = grid.permute(1, 2, 0).to('cpu', torch.uint8).numpy()
+        im = Image.fromarray(ndarr)
+        self.logger.experiment.log_image(im, name='val-img-step' + str(self.global_step),
+                                         step=self.global_step)
 
         return {'val_loss': avg_loss}
 
@@ -195,50 +196,61 @@ class DiffusionModel(pl.LightningModule):
 
 
 if __name__ == '__main__':
-    class Args():
-        train = True
-        comet = 1
-        ckpt_dir = "exp/cifa10/1122/"
-        ckpt_freq = 20
-        n_gpu = 1
-        model_dir= 'exp/cifa10/last.ckpt'
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train", type=int, default=1, help="Training or evaluation?")
+    parser.add_argument("--comet", type=int, default=0, help="use comet logger")
+    parser.add_argument("--exp_dir", type=str, default='exp', help="Path to folder to save checkpoints.")
+    parser.add_argument("--resume", type=str, default=None, help="Path to resume.")
+    parser.add_argument("--config_json", type=str, default=None, help="Path to config json file.")
+    parser.add_argument("--n_gpu", type=int, default=1, help="Number of available GPUs.")
+    parser.add_argument("--ckpt_freq", type=int, default=20, help="Frequency of saving the model (in epoch).")
+    args = parser.parse_args()
 
 
-    args = Args()
-    config = get_config()
+    if args.config_json is not None:
+        logger.info('Reading config from JSON: %s', args.config_json)
+        with open(args.config_json, 'r') as f:
+            config = ml_collections.ConfigDict(json.loads(f.read()))
+    else:
+        config = get_config()
 
-    if not os.path.isdir(args.ckpt_dir):
-        os.makedirs(args.ckpt_dir)
+    # save config as json
+    if not os.path.isdir(args.exp_dir):
+        os.makedirs(args.exp_dir)
+    cfg_path = os.path.join(args.exp_dir, 'config.json')
+    if not os.path.exists(cfg_path):
+        with open(cfg_path, 'w') as file:
+            file.write(config.to_json_best_effort(sort_keys=True, indent=4) + '\n')
 
-    d3pm = DiffusionModel(config)
+    d3pm = DiffusionModel(config, exp_dir=args.exp_dir)
 
     if args.train:
-        checkpoint_callback = ModelCheckpoint(dirpath=args.ckpt_dir,
-                                              filename='ddp_{epoch:02d}-{val_loss:.2f}',
-                                              monitor='val_loss',
+        checkpoint_callback = ModelCheckpoint(dirpath=args.exp_dir,
                                               verbose=False,
                                               save_last=True,
-                                              save_top_k=-1,
-                                              save_weights_only=True,
-                                              mode='min',
-                                              every_n_epochs=args.ckpt_freq
+                                              save_weights_only=False,
+                                              every_n_epochs=args.ckpt_freq,
+                                              save_on_train_epoch_end=True
                                               )
 
         comet_logger = CometLogger(
-            api_key="nGRMV8S1NSghQEh2WmxFb3ZnA",
+            api_key="",
             save_dir="logs/",  # Optional
-            project_name="discrete DPM",  # Optional
-            experiment_name="test-old-model",  # Optional
+            project_name="D3PM",  # Optional
+            experiment_name="d3pm-gaussian",  # Optional
         )
 
-        trainer = pl.Trainer(fast_dev_run=False,
-                             gpus=args.n_gpu,
-                             max_steps=config.train.num_train_steps,
-                             gradient_clip_val=1.,
-                             enable_progress_bar=True,
-                             enable_checkpointing=True,
-                             callbacks=[checkpoint_callback],
-                             logger=comet_logger
-                             )
+        trainer = pl.Trainer(
+            max_steps=config.train.num_train_steps,
+            gradient_clip_val=1.,
+            check_val_every_n_epoch=config.train.eval_every_epoch,
+            enable_progress_bar=True,
+            enable_checkpointing=True,
+            callbacks=[checkpoint_callback],
+            logger=comet_logger,
+            accelerator="gpu",
+            devices=args.n_gpu,
+            strategy="ddp"
+        )
 
-        trainer.fit(d3pm)
+        trainer.fit(d3pm, ckpt_path=args.resume)
