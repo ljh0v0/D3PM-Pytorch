@@ -2,6 +2,8 @@
 
 Unofficial PyTorch implementation of Discrete Denoising Diffusion Probabilistic Models(D3PMs)
 
+🚧 CONSTRUCTING...
+
 ## Training
 ```
 python3 main.py --train 1 --comet 1 --exp_dir "path/to/exp_dir/" --n_gpu 1 --ckpt_freq 20
