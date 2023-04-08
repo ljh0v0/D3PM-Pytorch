@@ -3,6 +3,10 @@
 Unofficial PyTorch implementation of Discrete Denoising Diffusion Probabilistic Models(D3PMs)
 
 🚧 UNDER CONSTRUCTION...
+## Experiments
+### D3PM-Gaussian on CIFAR10
+
+![gaussian_cifar10](https://user-images.githubusercontent.com/60313002/230746837-35d37f14-b696-4235-8d7a-e3fe8e1a0314.png)
 
 ## Training
 ```
